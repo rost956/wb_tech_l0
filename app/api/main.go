@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/segmentio/kafka-go"
 )
 
 type Orders struct {
@@ -126,15 +129,10 @@ func createItems(db *sql.Tx, items []Item, orderUID string) error {
 	return nil
 }
 
-func createOrders(db *sql.DB, filename string) error {
-
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return fmt.Errorf("error reading file: %v", err)
-	}
+func createOrders(db *sql.DB, order_name []byte) error {
 
 	var order Orders
-	if err := json.Unmarshal(data, &order); err != nil {
+	if err := json.Unmarshal(order_name, &order); err != nil {
 		return fmt.Errorf("error parsing JSON: %v", err)
 	}
 
@@ -193,7 +191,7 @@ func ReadSQLFile(filename string) (string, error) {
 }
 
 func GetOrderByUID(db *sql.DB, orderUID string) (Orders, error) {
-	query, err := ReadSQLFile("queries/get_query.sql")
+	query, err := ReadSQLFile("get_query.sql")
 	if err != nil {
 		return Orders{}, fmt.Errorf("error reading SQL file: %v", err)
 	}
@@ -235,7 +233,7 @@ func GetOrderByUID(db *sql.DB, orderUID string) (Orders, error) {
 
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return Orders{}, fmt.Errorf("order not found")
+			return Orders{}, sql.ErrNoRows
 		}
 		return Orders{}, fmt.Errorf("error executing query: %v", err)
 	}
@@ -261,26 +259,132 @@ func WriteOrderToFile(order Orders, filename string) error {
 	return nil
 }
 
+func InitDB() (*sql.DB, error) {
+	host := getEnv("DB_HOST", "localhost")
+	port := getEnv("DB_PORT", "5432")
+	user := getEnv("DB_USER", "myuser")
+	password := getEnv("DB_PASSWORD", "mypassword")
+	dbname := getEnv("DB_NAME", "mydatabase")
+	sslmode := getEnv("DB_SSLMODE", "disable")
+
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		host, port, user, password, dbname, sslmode)
+
+	var db *sql.DB
+	var err error
+
+	for i := 0; i < 5; i++ {
+		db, err = sql.Open("postgres", connStr)
+		if err != nil {
+			log.Printf("Failed to open database: %v. Retrying...", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		err = db.Ping()
+		if err == nil {
+			break
+		}
+
+		log.Printf("Failed to connect to database: %v. Retrying...", err)
+		time.Sleep(3 * time.Second)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("could not connect to database: %v", err)
+	}
+
+	log.Println("Connected to database successfully")
+	return db, nil
+}
+
+func getEnv(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	return value
+}
+
+func homeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		// Отображаем форму
+		tmpl := `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Поиск заказа</title>
+        </head>
+        <body>
+            <form action="/get-order" method="POST">
+                <input type="text" name="order_id" placeholder="Введите ID заказа" required>
+                <button type="submit">Отправить</button>
+            </form>
+        </body>
+        </html>`
+		fmt.Fprint(w, tmpl)
+	}
+}
+
+func orderHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" {
+		orderID := r.FormValue("order_id")
+		db, err := InitDB()
+		if err != nil {
+			log.Fatalf("Failed to initialize database: %v", err)
+		}
+		defer db.Close()
+		//ordersLock.Lock() - заготовка на будущее
+		order, err := GetOrderByUID(db, orderID)
+		//ordersLock.Unlock()
+		if err == sql.ErrNoRows {
+			fmt.Fprintf(w, "Заказ не найден!")
+		} else {
+			fmt.Fprintf(w, "Результат для заказа %s:\n", orderID)
+			order_json, _ := json.MarshalIndent(order, "", "  ")
+			fmt.Fprintf(w, "%s", order_json)
+		}
+
+	}
+}
+
 func main() {
-	connStr := "user=wbtech_test dbname=demo_kpc password=wbtech host=localhost sslmode=disable"
-	db, err := sql.Open("postgres", connStr)
+	time.Sleep(3 * time.Second)
+	db, err := InitDB()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	defer db.Close()
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		http.HandleFunc("/", homeHandler)
+		http.HandleFunc("/get-order", orderHandler)
+		log.Println("Starting HTTP server on :8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP server error: %v", err)
+			cancel()
+		}
+	}()
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:        []string{getEnv("KAFKA_BROKERS", "localhost:9092")},
+		Topic:          "orders",
+		GroupID:        "my_group",
+		CommitInterval: 0,
+	})
 
-	/*filename := "order.json"
+	for {
+		msg, err := reader.ReadMessage(context.Background())
+		if err != nil {
+			log.Printf("Возникла ошибка: %v", err)
+		}
+		err = createOrders(db, msg.Value)
+		if err != nil {
+			log.Printf("Возникла ошибка: %v", err)
+		}
 
-	if err := createOrders(db, filename); err != nil {
-		log.Fatalf("Error saving order: %v", err)
-	}*/
-	a, err := GetOrderByUID(db, "b563b7b2b84b6test")
-	if err != nil {
-		log.Fatal(err)
+		err = reader.CommitMessages(context.Background(), msg)
+		if err != nil {
+			log.Print(err)
+		}
 	}
-	err = WriteOrderToFile(a, "output.json")
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("Order saved successfully!")
 }
