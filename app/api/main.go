@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -58,7 +59,6 @@ type Payment struct {
 }
 
 type Item struct {
-	Item_id      int
 	Chrt_id      int    `json:"chrt_id"`
 	Track_number string `json:"track_number"`
 	Price        int    `json:"price"`
@@ -71,6 +71,8 @@ type Item struct {
 	Brand        string `json:"brand"`
 	Status       int    `json:"status"`
 }
+
+var cache = make(map[string]Orders)
 
 func createDelivery(db *sql.Tx, name, phone, zip, city, address, region, email string) (int, error) {
 	var deliveryID int
@@ -135,7 +137,7 @@ func createOrders(db *sql.DB, order_name []byte) error {
 	if err := json.Unmarshal(order_name, &order); err != nil {
 		return fmt.Errorf("error parsing JSON: %v", err)
 	}
-
+	cache[order.Order_uid] = order
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("error starting transaction: %v", err)
@@ -189,8 +191,47 @@ func ReadSQLFile(filename string) (string, error) {
 
 	return string(content), nil
 }
+func FillCache() error {
+	db, err := InitDB()
+	if err != nil {
+		log.Printf("Failed to initialize database: %v", err)
+		return fmt.Errorf("failed to initialize database: %v", err)
+	}
+	defer db.Close()
+	log.Println("Connected to database successfully")
+	orderUids, err := db.Query("SELECT order_uid FROM orders")
+	if err != nil {
+		return fmt.Errorf("error while receiving data: %v", err)
+	}
+	for orderUids.Next() {
+		var orderUid string
+		if err := orderUids.Scan(&orderUid); err != nil {
+			return fmt.Errorf("error while get order_uid: %v", err)
+		}
+		order, err := GetOrderByUID(orderUid)
+		if err != nil {
+			return fmt.Errorf("error while retrieving order data: %v", err)
+		}
+		cache[orderUid] = order
+	}
+	log.Println("Cache filled successfully")
+	return nil
+}
+func GetOrderByUID(orderUID string) (Orders, error) {
 
-func GetOrderByUID(db *sql.DB, orderUID string) (Orders, error) {
+	value, ok := cache[orderUID]
+	if ok {
+		log.Print("Value was in cache")
+		return value, nil
+	}
+
+	db, err := InitDB()
+	if err != nil {
+		log.Printf("Failed to initialize database: %v", err)
+		return Orders{}, fmt.Errorf("failed to initialize database: %v", err)
+	}
+	defer db.Close()
+
 	query, err := ReadSQLFile("get_query.sql")
 	if err != nil {
 		return Orders{}, fmt.Errorf("error reading SQL file: %v", err)
@@ -241,7 +282,7 @@ func GetOrderByUID(db *sql.DB, orderUID string) (Orders, error) {
 	if err := json.Unmarshal(itemsJSON, &order.Items); err != nil {
 		return Orders{}, fmt.Errorf("error parsing items JSON: %v", err)
 	}
-
+	cache[order.Order_uid] = order
 	return order, nil
 }
 
@@ -308,7 +349,6 @@ func getEnv(key, defaultValue string) string {
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		// Отображаем форму
 		tmpl := `
         <!DOCTYPE html>
         <html>
@@ -316,10 +356,16 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
             <title>Поиск заказа</title>
         </head>
         <body>
-            <form action="/get-order" method="POST">
-                <input type="text" name="order_id" placeholder="Введите ID заказа" required>
+            <form onsubmit="redirectToOrder(); return false;">
+                <input type="text" id="order_uid" placeholder="Введите ID заказа" required>
                 <button type="submit">Отправить</button>
             </form>
+            <script>
+                function redirectToOrder() {
+                    var orderId = document.getElementById('order_uid').value;
+                    window.location.href = '/order/' + encodeURIComponent(orderId);
+                }
+            </script>
         </body>
         </html>`
 		fmt.Fprint(w, tmpl)
@@ -327,44 +373,56 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func orderHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "POST" {
-		orderID := r.FormValue("order_id")
-		db, err := InitDB()
-		if err != nil {
-			log.Fatalf("Failed to initialize database: %v", err)
-		}
-		defer db.Close()
-		//ordersLock.Lock() - заготовка на будущее
-		order, err := GetOrderByUID(db, orderID)
-		//ordersLock.Unlock()
-		if err == sql.ErrNoRows {
-			fmt.Fprintf(w, "Заказ не найден!")
-		} else {
-			fmt.Fprintf(w, "Результат для заказа %s:\n", orderID)
-			order_json, _ := json.MarshalIndent(order, "", "  ")
-			fmt.Fprintf(w, "%s", order_json)
+	if r.Method == "GET" {
+		pathParts := strings.Split(r.URL.Path, "/")
+		if len(pathParts) < 3 {
+			http.Error(w, "Invalid URL format", http.StatusBadRequest)
+			return
 		}
 
+		orderUID := pathParts[2]
+
+		order, err := GetOrderByUID(orderUID)
+		if err == sql.ErrNoRows {
+			http.Error(w, "Заказ не найден!", http.StatusNotFound)
+			return
+		} else if err != nil {
+			log.Printf("Error getting order: %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		orderJSON, _ := json.MarshalIndent(order, "", "  ")
+		w.Write(orderJSON)
 	}
 }
 
 func main() {
 	time.Sleep(3 * time.Second)
+	err := FillCache()
+	if err != nil {
+		log.Printf("Error filling cache: %v", err)
+	}
 	db, err := InitDB()
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
+	defer db.Close()
+
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	go func() {
 		http.HandleFunc("/", homeHandler)
-		http.HandleFunc("/get-order", orderHandler)
+		http.HandleFunc("/order/", orderHandler)
 		log.Println("Starting HTTP server on :8080")
 		if err := http.ListenAndServe(":8080", nil); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP server error: %v", err)
 			cancel()
 		}
 	}()
+
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        []string{getEnv("KAFKA_BROKERS", "localhost:9092")},
 		Topic:          "orders",
